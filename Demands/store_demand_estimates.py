@@ -419,7 +419,7 @@ def save_to_excel(result_df, path="required_supply_weekday_saturday.xlsx", colle
 
 if __name__ == "__main__":
     # Example usage
-    df_raw = pd.read_csv("FoodstuffsDemand2026.csv", encoding="utf-8-sig")
+    df_raw = pd.read_csv("Resources/FoodstuffsDemand2026.csv", encoding="utf-8-sig")
 
     df_clean = remove_outliers(df_raw, z_thresh=3.5)
     df_clean = remove_zero_columns(df_clean)

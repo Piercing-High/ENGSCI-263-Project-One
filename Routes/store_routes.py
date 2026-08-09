@@ -338,7 +338,7 @@ if __name__ == "__main__":
     weekday_demand, saturday_demand = load_demand(
         "required_supply_weekday_saturday.xlsx"
     )
-    dur = load_duration_matrix("FoodstuffsDurations2026.csv")
+    dur = load_duration_matrix("Resources/FoodstuffsDurations2026.csv")
 
     weekday_pool = generate_route_pool(weekday_demand, dur, n_restarts=4000, seed=1)
     saturday_pool = generate_route_pool(saturday_demand, dur, n_restarts=4000, seed=2)
