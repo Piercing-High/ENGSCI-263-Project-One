@@ -365,11 +365,19 @@ def save_pools_to_excel(weekday_pool, saturday_pool, path="route_pools.xlsx"):
     return path
 
 
+from pathlib import Path
+
+# store_routes.py is in Routes/, so the project root is one level up
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DEMAND_XLSX = PROJECT_ROOT / "Demands" / "required_supply_weekday_saturday.xlsx"
+DURATIONS_CSV = PROJECT_ROOT / "Resources" / "FoodstuffsDurations2026.csv"
+ROUTE_POOLS_XLSX = PROJECT_ROOT / "Routes" / "route_pools.xlsx"
+
+
 if __name__ == "__main__":
-    weekday_demand, saturday_demand = load_demand(
-        "required_supply_weekday_saturday.xlsx"
-    )
-    dur = load_duration_matrix("FoodstuffsDurations2026.csv")
+    weekday_demand, saturday_demand = load_demand(DEMAND_XLSX)
+    dur = load_duration_matrix(DURATIONS_CSV)
 
     weekday_pool, weekday_zero = generate_route_pool(weekday_demand, dur, n_restarts=4000, seed=1)
     saturday_pool, saturday_zero = generate_route_pool(saturday_demand, dur, n_restarts=4000, seed=2)
@@ -377,4 +385,4 @@ if __name__ == "__main__":
     print("Weekday pool:", pool_summary(weekday_pool, weekday_demand, weekday_zero))
     print("Saturday pool:", pool_summary(saturday_pool, saturday_demand, saturday_zero))
 
-    save_pools_to_excel(weekday_pool, saturday_pool, "route_pools.xlsx")
+    save_pools_to_excel(weekday_pool, saturday_pool, ROUTE_POOLS_XLSX)
