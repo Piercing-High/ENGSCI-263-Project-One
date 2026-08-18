@@ -27,12 +27,17 @@ Business rules encoded here
 - Each store receives exactly one delivery per day -- so weekday and
   Saturday route pools are built as two entirely separate problems, from
   their respective pallet-demand figures.
+- Stores with zero demand on a given day (e.g. closed on Saturday) need no
+  delivery at all that day. They are excluded from route construction
+  entirely -- no singleton route is forced for them, and they never appear
+  in multi-store candidates -- and are reported separately rather than
+  being treated as "never covered" by the pool.
 - A generous sanity cutoff (default 6 hours) bounds candidate route
   duration purely to keep the pool computationally tractable -- it is not
   a business rule, just a practical limit on how long a "reasonable"
   candidate route can be. Singleton (one-store) routes are always kept
-  regardless of this cutoff, since every store must be covered by at
-  least one candidate route no matter how expensive.
+  regardless of this cutoff, since every store with nonzero demand must
+  be covered by at least one candidate route no matter how expensive.
 
 Pool construction
 ------------------
@@ -45,6 +50,13 @@ intermediate partial route along the way as its own candidate. This
 produces a large, varied pool of routes of many different sizes touching
 many different stores, which is what a downstream set-covering ILP needs
 to have real options to choose between.
+
+Every candidate is run through 2-opt (see `two_opt`) and *then* compared
+against other candidates covering the same store set -- optimizing before
+comparing, not after picking a "winner" -- since 2-opt is a local search
+whose result depends on the starting order, so comparing raw (pre-2-opt)
+construction times can discard an ordering that would have optimized
+better than the one that "looked" best going in.
 """
 
 import pandas as pd
@@ -115,6 +127,13 @@ def two_opt(route, dur):
     Simple 2-opt local search to reduce driving time for a fixed set of
     stores. Unload time doesn't depend on order, so only driving time
     needs improving here.
+
+    2-opt is a local search: the local optimum it converges to depends on
+    the order it's given as a starting point. Callers that are comparing
+    several candidate orderings of the same store set should run this on
+    every candidate BEFORE comparing/discarding any of them, not after
+    picking a "best" one by raw (un-optimized) distance -- see
+    `generate_route_pool.consider()`.
     """
     if len(route) < 3:
         return route
@@ -216,25 +235,38 @@ def generate_route_pool(demand, dur, n_restarts=4000, capacity=CAPACITY_PALLETS,
 
     Returns
     -------
-    pd.DataFrame
-        Columns: stores (tuple), n_stores, pallets, driving_min,
-        unload_min, total_min, total_hours, cost, is_overtime.
-        One row per distinct set of stores (the best/shortest-driving
-        ordering found for that set).
+    (pd.DataFrame, list[str])
+        pool : one row per distinct set of stores (the best/shortest-driving
+            ordering found for that set, after 2-opt). Columns: stores
+            (tuple), n_stores, pallets, driving_min, unload_min, total_min,
+            total_hours, cost, is_overtime.
+        zero_demand_stores : stores with demand == 0 for this day-type,
+            excluded from route construction entirely (see module
+            docstring) and reported here rather than folded into the pool
+            or flagged as "never covered".
     """
-    stores = [s for s in demand if s != WAREHOUSE]
+    all_stores = [s for s in demand if s != WAREHOUSE]
+    stores = [s for s in all_stores if demand[s] > 0]
+    zero_demand_stores = sorted(s for s in all_stores if demand[s] == 0)
+
     rng = random.Random(seed)
 
-    best_for_set = {}  # frozenset(stores) -> (driving_min, ordered_route)
+    best_for_set = {}  # frozenset(stores) -> (driving_min, ordered_route), both POST-2-opt
 
     def consider(route):
-        key = frozenset(route)
-        driving_min = route_driving_minutes(route, dur)
-        if key not in best_for_set or driving_min < best_for_set[key][0]:
-            best_for_set[key] = (driving_min, list(route))
+        # Optimize before comparing: 2-opt's result depends on the
+        # starting order, so comparing/discarding on raw construction
+        # time first would risk keeping an ordering that "looked" good
+        # but optimizes worse than one that got thrown away.
+        opt_route = two_opt(route, dur) if len(route) >= 3 else route
+        key = frozenset(opt_route)
+        driving_min = route_driving_minutes(opt_route, dur)
+        if key not in best_for_set or driving_min < best_for_set[key][0] - 1e-9:
+            best_for_set[key] = (driving_min, opt_route)
 
-    # mandatory: every store must have a singleton candidate, regardless
-    # of the sanity cutoff, so the pool always supports full coverage
+    # mandatory: every store with nonzero demand must have a singleton
+    # candidate, regardless of the sanity cutoff, so the pool always
+    # supports full coverage
     for s in stores:
         consider([s])
 
@@ -244,20 +276,16 @@ def generate_route_pool(demand, dur, n_restarts=4000, capacity=CAPACITY_PALLETS,
                 continue  # singletons already added above
             consider(snap)
 
-    # polish every kept route with 2-opt, then re-dedupe on the (possibly
-    # improved) driving time
     rows = []
     for key, (driving_min, route) in best_for_set.items():
-        improved_route = two_opt(route, dur)
-        improved_driving = route_driving_minutes(improved_route, dur)
-        pallets = sum(demand[s] for s in improved_route)
+        pallets = sum(demand[s] for s in route)
         unload_min = UNLOAD_MIN_PER_PALLET * pallets
-        total_min = improved_driving + unload_min
+        total_min = driving_min + unload_min
         rows.append({
-            "stores": tuple(improved_route),
-            "n_stores": len(improved_route),
+            "stores": tuple(route),
+            "n_stores": len(route),
             "pallets": pallets,
-            "driving_min": round(improved_driving, 1),
+            "driving_min": round(driving_min, 1),
             "unload_min": unload_min,
             "total_min": round(total_min, 1),
             "total_hours": round(total_min / 60.0, 2),
@@ -266,20 +294,23 @@ def generate_route_pool(demand, dur, n_restarts=4000, capacity=CAPACITY_PALLETS,
         })
 
     out = pd.DataFrame(rows).sort_values(["n_stores", "total_min"]).reset_index(drop=True)
-    return out
+    return out, zero_demand_stores
 
 
-def pool_summary(pool_df, demand):
+def pool_summary(pool_df, demand, zero_demand_stores=None):
     """Quick sanity-check summary of a generated route pool."""
+    zero_demand_stores = zero_demand_stores or []
     n_stores_total = len([s for s in demand])
     covered = set()
     for stores in pool_df["stores"]:
         covered.update(stores)
+    never_covered = set(demand) - covered - set(zero_demand_stores)
     return {
         "n_candidate_routes": len(pool_df),
         "n_stores_total": n_stores_total,
         "n_stores_covered_by_pool": len(covered),
-        "stores_never_covered": sorted(set(demand) - covered),
+        "stores_never_covered": sorted(never_covered),
+        "zero_demand_stores_excluded": sorted(zero_demand_stores),
         "n_overtime_routes": int(pool_df["is_overtime"].sum()),
         "route_size_distribution": pool_df["n_stores"].value_counts().sort_index().to_dict(),
     }
@@ -334,16 +365,24 @@ def save_pools_to_excel(weekday_pool, saturday_pool, path="route_pools.xlsx"):
     return path
 
 
+from pathlib import Path
+
+# store_routes.py is in Routes/, so the project root is one level up
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DEMAND_XLSX = PROJECT_ROOT / "Demands" / "required_supply_weekday_saturday.xlsx"
+DURATIONS_CSV = PROJECT_ROOT / "Resources" / "FoodstuffsDurations2026.csv"
+ROUTE_POOLS_XLSX = PROJECT_ROOT / "Routes" / "route_pools.xlsx"
+
+
 if __name__ == "__main__":
-    weekday_demand, saturday_demand = load_demand(
-        "required_supply_weekday_saturday.xlsx"
-    )
-    dur = load_duration_matrix("Resources/FoodstuffsDurations2026.csv")
+    weekday_demand, saturday_demand = load_demand(DEMAND_XLSX)
+    dur = load_duration_matrix(DURATIONS_CSV)
 
-    weekday_pool = generate_route_pool(weekday_demand, dur, n_restarts=4000, seed=1)
-    saturday_pool = generate_route_pool(saturday_demand, dur, n_restarts=4000, seed=2)
+    weekday_pool, weekday_zero = generate_route_pool(weekday_demand, dur, n_restarts=4000, seed=1)
+    saturday_pool, saturday_zero = generate_route_pool(saturday_demand, dur, n_restarts=4000, seed=2)
 
-    print("Weekday pool:", pool_summary(weekday_pool, weekday_demand))
-    print("Saturday pool:", pool_summary(saturday_pool, saturday_demand))
+    print("Weekday pool:", pool_summary(weekday_pool, weekday_demand, weekday_zero))
+    print("Saturday pool:", pool_summary(saturday_pool, saturday_demand, saturday_zero))
 
-    save_pools_to_excel(weekday_pool, saturday_pool, "route_pools.xlsx")
+    save_pools_to_excel(weekday_pool, saturday_pool, ROUTE_POOLS_XLSX)
