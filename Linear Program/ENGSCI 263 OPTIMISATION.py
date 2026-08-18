@@ -1,6 +1,10 @@
 from pulp import *
 import pandas as pd
 import math
+from pathlib import Path 
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ROUTE_POOLS_XLSX = PROJECT_ROOT / "Routes" / "route_pools.xlsx"
 
 
 # =============================================================================
@@ -449,7 +453,7 @@ def solve_routing(routes_df, day_name, truck_cap=40,
     # 6. SOLVE
     # =========================================================================
 
-    prob.solve()
+    prob.solve(PULP_CBC_CMD(msg=False))
 
 
     # =========================================================================
@@ -553,15 +557,8 @@ def solve_routing(routes_df, day_name, truck_cap=40,
 #
 # The optimisation function will then process whichever DataFrame we give it.
 
-weekday_raw = pd.read_excel(
-    "route_pools.xlsx",
-    sheet_name="Weekday Pool"
-)
-
-saturday_raw = pd.read_excel(
-    "route_pools.xlsx",
-    sheet_name="Saturday Pool"
-)
+weekday_raw = pd.read_excel(ROUTE_POOLS_XLSX, sheet_name="Weekday Pool")
+saturday_raw = pd.read_excel(ROUTE_POOLS_XLSX, sheet_name="Saturday Pool")
 
 
 # =============================================================================
@@ -609,3 +606,64 @@ sat_shed_prob, sat_shed_routes, sat_shed_x, sat_shed_selected, sat_shed_stores =
     allow_shedding=True,
     shed_fraction=0.20
 )
+
+# =============================================================================
+# 12. SUMMARY TABLE + SAVE SELECTED ROUTES
+# =============================================================================
+
+def summarise(prob, routes_df, selected, shed_stores, label):
+    """Collect one scenario's key results into a dict."""
+    fleet = [r for r in selected if routes_df.loc[r, "source"] == "Fleet"]
+    linfox = [r for r in selected if routes_df.loc[r, "source"] == "Linfox"]
+    return {
+        "Scenario": label,
+        "Total cost ($)": round(value(prob.objective), 2),
+        "Fleet routes": len(fleet),
+        "Linfox routes": len(linfox),
+        "Stores shed": len(shed_stores),
+    }
+
+summary = pd.DataFrame([
+    summarise(wk_prob,      wk_routes,      wk_selected,      [],             "Weekday baseline"),
+    summarise(sat_prob,     sat_routes,     sat_selected,     [],             "Saturday baseline"),
+    summarise(wk_shed_prob, wk_shed_routes, wk_shed_selected, wk_shed_stores, "Weekday + shedding"),
+    summarise(sat_shed_prob,sat_shed_routes,sat_shed_selected,sat_shed_stores,"Saturday + shedding"),
+])
+
+print("\n" + "="*60)
+print("SUMMARY")
+print("="*60)
+print(summary.to_string(index=False))
+
+
+def selected_routes_df(routes_df, selected, day_label):
+    """Build a tidy table of the routes actually chosen for one scenario."""
+    rows = []
+    for r in selected:
+        rows.append({
+            "day": day_label,
+            "source": routes_df.loc[r, "source"],
+            "route": routes_df.loc[r, "route"],
+            "stores": ", ".join(routes_df.loc[r, "stores"]),
+            "n_stores": len(routes_df.loc[r, "stores"]),
+            "total_hours": routes_df.loc[r, "total_hours"],
+            "cost": routes_df.loc[r, "cost"],
+        })
+    return pd.DataFrame(rows)
+
+# Save selected routes for ALL scenarios
+scenarios = [
+    (wk_routes,       wk_selected,       "Weekday",  "Weekday Baseline"),
+    (sat_routes,      sat_selected,      "Saturday", "Saturday Baseline"),
+    (wk_shed_routes,  wk_shed_selected,  "Weekday",  "Weekday Shedding"),
+    (sat_shed_routes, sat_shed_selected, "Saturday", "Saturday Shedding"),
+]
+
+out_path = PROJECT_ROOT / "Linear Program" / "selected_routes.xlsx"
+with pd.ExcelWriter(out_path) as writer:
+    for routes_df, selected, day_label, sheet in scenarios:
+        selected_routes_df(routes_df, selected, day_label).to_excel(
+            writer, sheet_name=sheet, index=False)
+    summary.to_excel(writer, sheet_name="Summary", index=False)
+
+print(f"\nSaved selected routes to: {out_path}")
